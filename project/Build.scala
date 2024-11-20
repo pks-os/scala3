@@ -327,7 +327,7 @@ object Build {
         .withTestRetryConfiguration(
           config.testRetryConfiguration
             .withFlakyTestPolicy(FlakyTestPolicy.Fail)
-            .withMaxRetries(1)
+            .withMaxRetries(if (isInsideCI) 1 else 0)
             .withMaxFailures(10)
             .withClassesFilter((className, _) => !noRetryTestClasses.contains(className))
         )
@@ -383,7 +383,7 @@ object Build {
     ),
 
     // This is used to download nightly builds of the Scala 2 library in `scala2-library-bootstrapped`
-    resolvers += "scala-integration" at "https://scala-ci.typesafe.com/artifactory/scala-integration/",
+    resolvers += "scala-integration" at "https://scala-ci.typesafe.com/artifactory/scala-integration/"
   )
 
   lazy val disableDocSetting =
@@ -1455,7 +1455,7 @@ object Build {
       BuildInfoPlugin.buildInfoDefaultSettings
 
   lazy val presentationCompilerSettings = {
-    val mtagsVersion = "1.3.5"
+    val mtagsVersion = "1.4.1"
     Seq(
       libraryDependencies ++= Seq(
         "org.lz4" % "lz4-java" % "1.8.0",
