@@ -38,8 +38,7 @@ import config.Printers.{core, typr, matchTypes}
 import reporting.{trace, Message}
 import java.lang.ref.WeakReference
 import compiletime.uninitialized
-import cc.{CapturingType, CaptureRef, CaptureSet, SingletonCaptureRef, isTrackableRef,
-           derivedCapturingType, isBoxedCapturing, isCaptureChecking, isRetains, isRetainsLike}
+import cc.*
 import CaptureSet.{CompareResult, IdempotentCaptRefMap, IdentityCaptRefMap}
 
 import scala.annotation.internal.sharable
@@ -99,12 +98,8 @@ object Types extends TypeUtils {
 // ----- Tests -----------------------------------------------------
 
 //    // debug only: a unique identifier for a type
-//    val uniqId = {
-//      nextId = nextId + 1
-//      if (nextId == 19555)
-//        println("foo")
-//      nextId
-//    }
+//    val uniqId = { nextId = nextId + 1; nextId }
+//    if uniqId == 19555 then trace.dumpStack()
 
     /** A cache indicating whether the type was still provisional, last time we checked */
     @sharable private var mightBeProvisional = true
@@ -867,23 +862,19 @@ object Types extends TypeUtils {
         }
         else
           val isRefinedMethod = rinfo.isInstanceOf[MethodOrPoly]
-          rinfo match
-            case CapturingType(_, refs: CaptureSet.RefiningVar) if ccConfig.optimizedRefinements =>
-              pdenot.asSingleDenotation.derivedSingleDenotation(pdenot.symbol, rinfo)
+          val joint = pdenot.meet(
+            new JointRefDenotation(NoSymbol, rinfo, Period.allInRun(ctx.runId), pre, isRefinedMethod),
+            pre,
+            safeIntersection = ctx.base.pendingMemberSearches.contains(name))
+          joint match
+            case joint: SingleDenotation
+            if isRefinedMethod
+              && (rinfo <:< joint.info
+                || name == nme.apply && defn.isFunctionType(tp.parent)) =>
+              // use `rinfo` to keep the right parameter names for named args. See i8516.scala.
+              joint.derivedSingleDenotation(joint.symbol, rinfo, pre, isRefinedMethod)
             case _ =>
-              val joint = pdenot.meet(
-                new JointRefDenotation(NoSymbol, rinfo, Period.allInRun(ctx.runId), pre, isRefinedMethod),
-                pre,
-                safeIntersection = ctx.base.pendingMemberSearches.contains(name))
-              joint match
-                case joint: SingleDenotation
-                if isRefinedMethod
-                  && (rinfo <:< joint.info
-                    || name == nme.apply && defn.isFunctionType(tp.parent)) =>
-                  // use `rinfo` to keep the right parameter names for named args. See i8516.scala.
-                  joint.derivedSingleDenotation(joint.symbol, rinfo, pre, isRefinedMethod)
-                case _ =>
-                  joint
+              joint
       }
 
       def goApplied(tp: AppliedType, tycon: HKTypeLambda) =
@@ -4078,6 +4069,10 @@ object Types extends TypeUtils {
               range(defn.NothingType, atVariance(1)(apply(tp.underlying)))
             case CapturingType(_, _) =>
               mapOver(tp)
+            case ReachCapability(tp1) =>
+              apply(tp1) match
+                case tp1a: CaptureRef if tp1a.isTrackableRef => tp1a.reach
+                case _ => defn.captureRoot.termRef
             case AnnotatedType(parent, ann) if ann.refersToParamOf(thisLambdaType) =>
               val parent1 = mapOver(parent)
               if ann.symbol.isRetainsLike then
@@ -4179,24 +4174,28 @@ object Types extends TypeUtils {
      *   - wrap types of parameters that have an @allowConversions annotation with Into[_]
      */
     def fromSymbols(params: List[Symbol], resultType: Type)(using Context): MethodType =
+      apply(params.map(_.name.asTermName))(
+         tl => params.map(p => tl.integrate(params, adaptParamInfo(p))),
+         tl => tl.integrate(params, resultType))
+
+    /** Adapt info of parameter symbol to be integhrated into corresponding MethodType
+     *  using the scheme described in `fromSymbols`.
+     */
+    def adaptParamInfo(param: Symbol, pinfo: Type)(using Context): Type =
       def addAnnotation(tp: Type, cls: ClassSymbol, param: Symbol): Type = tp match
         case ExprType(resType) => ExprType(addAnnotation(resType, cls, param))
         case _ => AnnotatedType(tp, Annotation(cls, param.span))
+      var paramType = pinfo
+        .annotatedToRepeated
+        .mapIntoAnnot(defn.IntoAnnot, defn.IntoParamAnnot)
+      if param.is(Inline) then
+        paramType = addAnnotation(paramType, defn.InlineParamAnnot, param)
+      if param.is(Erased) then
+        paramType = addAnnotation(paramType, defn.ErasedParamAnnot, param)
+      paramType
 
-      def paramInfo(param: Symbol) =
-        var paramType = param.info
-          .annotatedToRepeated
-          .mapIntoAnnot(defn.IntoAnnot, defn.IntoParamAnnot)
-        if param.is(Inline) then
-          paramType = addAnnotation(paramType, defn.InlineParamAnnot, param)
-        if param.is(Erased) then
-          paramType = addAnnotation(paramType, defn.ErasedParamAnnot, param)
-        paramType
-
-      apply(params.map(_.name.asTermName))(
-         tl => params.map(p => tl.integrate(params, paramInfo(p))),
-         tl => tl.integrate(params, resultType))
-    end fromSymbols
+    def adaptParamInfo(param: Symbol)(using Context): Type =
+      adaptParamInfo(param, param.info)
 
     def apply(paramNames: List[TermName])(paramInfosExp: MethodType => List[Type], resultTypeExp: MethodType => Type)(using Context): MethodType =
       checkValid(unique(new CachedMethodType(paramNames)(paramInfosExp, resultTypeExp, self)))
@@ -5578,24 +5577,25 @@ object Types extends TypeUtils {
     }
 
     def & (that: TypeBounds)(using Context): TypeBounds =
+      val lo1 = this.lo.stripLazyRef
+      val lo2 = that.lo.stripLazyRef
+      val hi1 = this.hi.stripLazyRef
+      val hi2 = that.hi.stripLazyRef
+
       // This will try to preserve the FromJavaObjects type in upper bounds.
       // For example, (? <: FromJavaObjects | Null) & (? <: Any),
       // we want to get (? <: FromJavaObjects | Null) intead of (? <: Any),
       // because we may check the result <:< (? <: Object | Null) later.
-      if this.hi.containsFromJavaObject
-        && (this.hi frozen_<:< that.hi)
-        && (that.lo frozen_<:< this.lo) then
+      if hi1.containsFromJavaObject && (hi1 frozen_<:< hi2) && (lo2 frozen_<:< lo1) then
         // FromJavaObject in tp1.hi guarantees tp2.hi <:< tp1.hi
         // prefer tp1 if FromJavaObject is in its hi
         this
-      else if that.hi.containsFromJavaObject
-        && (that.hi frozen_<:< this.hi)
-        && (this.lo frozen_<:< that.lo) then
+      else if hi2.containsFromJavaObject && (hi2 frozen_<:< hi1) && (lo1 frozen_<:< lo2) then
         // Similarly, prefer tp2 if FromJavaObject is in its hi
         that
-      else if (this.lo frozen_<:< that.lo) && (that.hi frozen_<:< this.hi) then that
-      else if (that.lo frozen_<:< this.lo) && (this.hi frozen_<:< that.hi) then this
-      else TypeBounds(this.lo | that.lo, this.hi & that.hi)
+      else if (lo1 frozen_<:< lo2) && (hi2 frozen_<:< hi1) then that
+      else if (lo2 frozen_<:< lo1) && (hi1 frozen_<:< hi2) then this
+      else TypeBounds(lo1 | lo2, hi1 & hi2)
 
     def | (that: TypeBounds)(using Context): TypeBounds =
       if ((this.lo frozen_<:< that.lo) && (that.hi frozen_<:< this.hi)) this
@@ -5604,7 +5604,7 @@ object Types extends TypeUtils {
 
     override def & (that: Type)(using Context): Type = that match {
       case that: TypeBounds => this & that
-      case _ => super.& (that)
+      case _ => super.&(that)
     }
 
     override def | (that: Type)(using Context): Type = that match {
